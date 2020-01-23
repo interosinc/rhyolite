@@ -68,7 +68,7 @@ import Obelisk.Route.Frontend hiding (Decoder)
 import Language.Javascript.JSaddle hiding (Success)
 
 #if defined(ghcjs_HOST_OS)
-import GHCJS.DOM.Types (MonadJSM, pFromJSVal)
+import GHCJS.DOM.Types (pFromJSVal)
 import System.IO.Unsafe (unsafePerformIO)
 #else
 import GHCJS.DOM.Types (MonadJSM(..))
