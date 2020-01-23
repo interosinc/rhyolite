@@ -64,8 +64,11 @@ import Obelisk.Configs
 import Obelisk.Route hiding (Decoder)
 import Obelisk.Route.Frontend hiding (Decoder)
 
+import Language.Javascript.JSaddle hiding (Success)
+
 #if defined(ghcjs_HOST_OS)
 import GHCJS.DOM.Types (MonadJSM, pFromJSVal)
+import System.IO.Unsafe (unsafePerformIO)
 #else
 import GHCJS.DOM.Types (MonadJSM(..))
 import Rhyolite.Request.Common (decodeValue')
@@ -406,7 +409,10 @@ openWebSocket'
   -> m (AppWebSocket t q)
 openWebSocket' url request vs = do
 #if defined(ghcjs_HOST_OS)
-  rec let platformDecode = jsonDecode . pFromJSVal
+  rec let platformDecode = \d ->
+            let !scope = enterScopeGhcjs "Rhyolite.Frontend.App.openWebSocket.platformDecode"
+                !result = jsonDecode . pFromJSVal $ d
+             in leaveScopeGhcjs scope result
           rawWebSocket cfg = webSocket' url cfg (either (error "webSocket': expected JSVal") return)
       ws <- rawWebSocket $ def
 #else
@@ -537,3 +543,38 @@ watchView q = (fmap.fmap) runIdentity <$> queryViewMorphism 1 q
 -- Reminder to self, this ^^^^^^^^^^^ identity is the QueryResult for the Const g
 -- in the ViewMorphism and is unrelated to the fixed Identity in the fourth
 -- parameter.
+
+wtfGlobal :: Text
+wtfGlobal = "WEB_TRACING_FRAMEWORK"
+
+newtype Scope = Scope (Maybe JSVal)
+
+enterScopeJSM :: Text -> JSM Scope
+enterScopeJSM scopeName = do
+  wtf <- eval wtfGlobal
+  wtfTrace <- wtf ! ("trace" :: Text)
+  scope <- wtfTrace # ("enterScope" :: Text) $ [ scopeName ]
+  pure $ Scope $ Just scope
+
+enterScopeGhcjs :: Text -> Scope
+#ifdef ghcjs_HOST_OS
+{-# NOINLINE enterScopeGhcjs #-}
+enterScopeGhcjs name = unsafePerformIO $ enterScopeJSM name
+#else
+enterScopeGhcjs _ = Scope Nothing
+#endif
+
+leaveScopeJSM :: Scope -> JSM ()
+leaveScopeJSM (Scope (Just s)) = void $ liftJSM $ do
+  wtf <- eval wtfGlobal
+  wtfTrace <- wtf ! ("trace" :: Text)
+  wtfTrace # ("leaveScope" :: Text) $ [ s ]
+leaveScopeJSM _ = pure ()
+
+leaveScopeGhcjs :: Scope -> a -> a
+#ifdef ghcjs_HOST_OS
+{-# NOINLINE leaveScopeGhcjs #-}
+leaveScopeGhcjs scope v = (unsafePerformIO $ leaveScopeJSM scope) `seq` v
+#else
+leaveScopeGhcjs _ = id
+#endif
