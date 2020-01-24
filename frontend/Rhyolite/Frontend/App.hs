@@ -357,7 +357,7 @@ runPrerenderedRhyoliteWidget toWire url child = do
       ((a, vs), request) <- flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
       let (vsDyn :: Dynamic t qFrontend) = incrementalToDynamic (vs :: Incremental t (AdditivePatch qFrontend))
       nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
-      view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
+      view :: Dynamic t (QueryResult qFrontend) <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
   return a
   where
     reqEncoder :: forall a. req a -> (Aeson.Value, Aeson.Value -> Maybe a)
@@ -410,10 +410,7 @@ openWebSocket'
   -> m (AppWebSocket t q)
 openWebSocket' url request vs = do
 #if defined(ghcjs_HOST_OS)
-  rec let platformDecode = \d ->
-            let !scope = enterScopeGhcjs "Rhyolite.Frontend.App.openWebSocket.platformDecode"
-                !result = jsonDecode . pFromJSVal $ d
-             in leaveScopeGhcjs scope result
+  rec let platformDecode = instrument "Rhyolite.Frontend.App.openWebSocket.platformDecode" (jsonDecode . pFromJSVal)
           rawWebSocket cfg = webSocket' url cfg (either (error "webSocket': expected JSVal") return)
       ws <- rawWebSocket $ def
 #else
@@ -578,4 +575,15 @@ leaveScopeGhcjs :: Scope -> a -> a
 leaveScopeGhcjs scope v = (unsafePerformIO $ leaveScopeJSM scope) `seq` v
 #else
 leaveScopeGhcjs _ = id
+#endif
+
+instrument ::  Text -> (a -> b) -> (a -> b)
+#ifdef ghcjs_HOST_OS
+{-# NOINLINE instrument #-}
+instrument scopeName f x = unsafePerformIO $ do
+  !scope <- enterScopeJSM scopeName
+  !result <- f <$!> (const (pure x) scope)
+  pure $! leaveScopeGhcjs result
+#else
+instrument _ f = f
 #endif
