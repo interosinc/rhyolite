@@ -582,8 +582,8 @@ instrument ::  Text -> (a -> b) -> (a -> b)
 {-# NOINLINE instrument #-}
 instrument scopeName f x = unsafePerformIO $ do
   !scope <- enterScopeJSM scopeName
-  !result <- f <$!> (const (pure x) scope)
-  pure $! leaveScopeGhcjs result
+  (!result, !scope') <- (\(a, b) -> (f a, b)) <$!> pure (x, scope)
+  pure $! leaveScopeGhcjs scope' result
 #else
 instrument _ f = f
 #endif
