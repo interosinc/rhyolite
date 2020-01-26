@@ -24,6 +24,7 @@ import Control.Lens (imapM_)
 import Control.Monad
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Aeson (FromJSON, ToJSON, toJSON)
+import Data.Aeson.Text (encodeToLazyText)
 import Data.Align
 import Data.Constraint.Extras
 import Data.Map.Monoidal (MonoidalMap)
@@ -35,7 +36,9 @@ import Data.Pool (Pool)
 import Data.Semigroup (Semigroup, (<>))
 import Data.Some (Some(Some))
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.IO as T
+import qualified Data.Text.Lazy as TL
 import Data.Typeable (Typeable)
 import Data.Witherable (Filterable(..))
 import Debug.Trace (trace)
@@ -57,7 +60,7 @@ import Rhyolite.Concurrent
 import Rhyolite.Sign (Signed)
 import Rhyolite.Backend.WebSocket (withWebsocketsConnection, getDataMessage, sendEncodedDataMessage)
 import Rhyolite.Backend.Sign (readSignedWithKey)
-import Rhyolite.WebSocket (TaggedRequest (..), TaggedResponse (..), WebSocketResponse (..), WebSocketRequest (..))
+import Rhyolite.WebSocket (Channels(..), Chunk(..), TaggedRequest (..), TaggedResponse (..), WebSocketResponse (..), WebSocketRequest (..), toChunks)
 
 -- | This query morphism translates between un-annotated queries for use over the wire, and ones with SelectedCount annotations used in the backend to be able to determine the differences between queries. This version is for use with the older Functor style of queries and results.
 functorFromWire
@@ -262,7 +265,7 @@ handleWebsocket v fromWire rh register = withWebsocketsConnection (handleWebsock
 
 -- | Handles a websocket connection given a raw connection.
 handleWebsocketConnection
-  :: forall r q qWire.
+  :: forall r q qWire channelId.
     ( Request r
     , Eq (QueryResult q)
     , ToJSON (QueryResult qWire)
@@ -271,7 +274,7 @@ handleWebsocketConnection
     , Query q
     )
   => Text -- ^ Version
-  -> QueryMorphism qWire q -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
+  -> QueryMorphism (Channels channelId qWire) (Channels channelId q) -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
   -> RequestHandler r IO -- ^ Handler for API requests
   -> Registrar q
   -> WS.Connection
@@ -279,6 +282,7 @@ handleWebsocketConnection
 handleWebsocketConnection v fromWire rh register conn = do
   let sender = Recipient $ sendEncodedDataMessage conn . (\a -> WebSocketResponse_View (_queryMorphism_mapQueryResult fromWire a) :: WebSocketResponse qWire)
   sendEncodedDataMessage conn (WebSocketResponse_Version v :: WebSocketResponse qWire)
+  -- TODO implement channel-based queuing of web socket messages
   bracket (unRegistrar register sender) snd $ \(vsHandler, _) -> forever $ do
     (wsr :: WebSocketRequest qWire r) <- liftIO $ getDataMessage conn
     case wsr of
@@ -287,9 +291,19 @@ handleWebsocketConnection v fromWire rh register conn = do
         sendEncodedDataMessage conn
           (WebSocketResponse_Api $ TaggedResponse reqId (has @ToJSON req (toJSON a)) :: WebSocketResponse qWire)
       WebSocketRequest_ViewSelector new -> do
-        qr <- runQueryHandler vsHandler (_queryMorphism_mapQuery fromWire new)
-        when (qr /= mempty) $ do
-          sendEncodedDataMessage conn (WebSocketResponse_View (_queryMorphism_mapQueryResult fromWire qr) :: WebSocketResponse qWire)
+        Channels qr <- runQueryHandler vsHandler (_queryMorphism_mapQuery fromWire new)
+        void $ flip Map.traverseWithKey qr $ \channelId channelResult -> do
+          let (payloads, numChunks) = toChunks channelResult
+              mkChunk i payload = Chunk
+                { _chunk_number = i
+                , _chunk_totalChunks = numChunks
+                , _chunk_payload = TL.toStrict $ encodeToLazyText payload
+                }
+              chunks = zipWith mkChunk [1..] payloads
+          forM_ chunks $ \c -> do
+            let c' = Map.singleton channelId c
+            -- TODO write to queue instead of immediately sending
+            sendEncodedDataMessage conn (WebSocketResponse_View c')
 
 -------------------------------------------------------------------------------
 

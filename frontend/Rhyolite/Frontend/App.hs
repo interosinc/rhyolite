@@ -300,13 +300,16 @@ runObeliskRhyoliteWidget ::
   , Eq qWire
   , Monoid (QueryResult qFrontend)
   , FromJSON (QueryResult qWire)
+  , FromJSONKey viewChannel
   , ToJSON qWire
+  , ToJSONKey viewChannel
+  , Ord viewChannel
   )
-  => QueryMorphism qFrontend qWire
+  => QueryMorphism (ChannelQuery viewChannel qFrontend) (ChannelQuery viewChannel qWire)
   -> Text -- ^ Typically "config/route", config file containing an http/https URL at which the backend will be served.
   -> Encoder Identity Identity (R (FullRoute backendRoute frontendRoute)) PageName -- ^ Checked route encoder
   -> R backendRoute -- ^ The "listen" backend route which is handled by the action produced by 'serveDbOverWebsockets'
-  -> RoutedT t (R frontendRoute) (RhyoliteWidget qFrontend req t m) a -- ^ Child widget
+  -> RoutedT t (R frontendRoute) (RhyoliteWidget (ChannelQuery viewChannel qFrontend) req t m) a -- ^ Child widget
   -> RoutedT t (R frontendRoute) m a
 runObeliskRhyoliteWidget toWire configRoute enc listenRoute child = do
   obR <- askRoute
@@ -319,7 +322,7 @@ runObeliskRhyoliteWidget toWire configRoute enc listenRoute child = do
   lift $ runPrerenderedRhyoliteWidget toWire wsUrl $ flip runRoutedT obR $ child
 
 runPrerenderedRhyoliteWidget
-   :: forall qFrontend qWire req m t b x.
+   :: forall qFrontend qWire viewChannel req m t b x.
       ( PerformEvent t m
       , TriggerEvent t m
       , PostBuild t m
@@ -333,16 +336,19 @@ runPrerenderedRhyoliteWidget
       , Eq qWire
       , Monoid (QueryResult qFrontend)
       , FromJSON (QueryResult qWire)
+      , FromJSONKey viewChannel
       , ToJSON qWire
+      , ToJSONKey viewChannel
+      , Ord viewChannel
       )
-   => QueryMorphism qFrontend qWire
+   => QueryMorphism (ChannelQuery viewChannel qFrontend) (ChannelQuery viewChannel qWire)
    -> Text
-   -> RhyoliteWidget qFrontend req t m b
+   -> RhyoliteWidget (ChannelQuery viewChannel qFrontend) req t m b
    -> m b
 runPrerenderedRhyoliteWidget toWire url child = do
-  rec (notification :: Event t (QueryResult qWire), response) <- fmap (bimap (switch . current) (switch . current) . splitDynPure) $
+  rec (notification :: Event t (ChannelView viewChannel qWire), response) <- fmap (bimap (switch . current) (switch . current) . splitDynPure) $
         prerender (return (never, never)) $ do
-          (appWebSocket :: AppWebSocket t q) <- openWebSocket' url request'' nubbedVs
+          (appWebSocket :: AppWebSocket t (ChannelQuery viewChannel q)) <- openWebSocket' url request'' nubbedVs
           return ( _appWebSocket_notification appWebSocket
                  , _appWebSocket_response appWebSocket
                  )
@@ -351,7 +357,7 @@ runPrerenderedRhyoliteWidget toWire url child = do
             Success (v' :: (Some req)) -> Just $ TaggedRequest t v'
             _ -> Nothing)) request'
       ((a, vs), request) <- flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
-      let (vsDyn :: Dynamic t qFrontend) = incrementalToDynamic (vs :: Incremental t (AdditivePatch qFrontend))
+      let (vsDyn :: Dynamic t (ChannelQuery viewChannel qFrontend)) = incrementalToDynamic (vs :: Incremental t (AdditivePatch (ChannelQuery viewChannel qFrontend)))
       nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
       view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
   return a
@@ -365,10 +371,10 @@ runPrerenderedRhyoliteWidget toWire url child = do
       )
 
 fromNotifications
-  :: forall m (t :: *) q. (Query q, MonadHold t m, PerformEvent t m, TriggerEvent t m, MonadIO (Performable m), Reflex t, MonadFix m, Monoid (QueryResult q))
-  => Dynamic t q
-  -> Event t (QueryResult q)
-  -> m (Dynamic t (QueryResult q))
+  :: forall m (t :: *) viewChannel q. (Ord viewChannel, Query q, MonadHold t m, PerformEvent t m, TriggerEvent t m, MonadIO (Performable m), Reflex t, MonadFix m, Monoid (QueryResult q))
+  => Dynamic t (ChannelQuery viewChannel q)
+  -> Event t (ChannelView viewChannel q)
+  -> m (Dynamic t (ChannelView viewChannel q))
 fromNotifications vs ePatch = do
   ePatchThrottled <- throttleBatchWithLag lag ePatch
   foldDyn (\(vs', p) v -> cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
