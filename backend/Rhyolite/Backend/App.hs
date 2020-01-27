@@ -450,10 +450,14 @@ serveDbOverWebsocketsRaw
   -> Pipeline IO (MonoidalMap ClientKey q) q'
   -> IO (m a, IO ())
 serveDbOverWebsocketsRaw withWsConn version fromWire db handleApi handleNotify handleQuery pipe = do
-  (getNextNotification, finalizeListener) <- startNotificationListener db
-  rec (qh, finalizeFeed) <- feedPipeline (handleNotify <$> getNextNotification) handleQuery r
-      (qh', r) <- unPipeline pipe qh r'
-      (r', handleListen) <- connectPipelineToWebsocketsRaw withWsConn version fromWire handleApi qh'
+  (getNextNotification :: IO notifyMessage, finalizeListener :: IO ()) <-
+    startNotificationListener db
+  rec (qh :: QueryHandler q' IO, finalizeFeed :: IO ()) <-
+        feedPipeline (handleNotify <$> getNextNotification) handleQuery r
+      (qh' :: QueryHandler (MonoidalMap ClientKey q) IO, r :: Recipient q' IO) <-
+        unPipeline pipe qh r'
+      (r' :: Recipient (MonoidalMap ClientKey q) IO, handleListen :: m a) <-
+        connectPipelineToWebsocketsRaw withWsConn version fromWire handleApi qh'
   return (handleListen, finalizeFeed >> finalizeListener)
 
 convertPostgresPool :: Pool Pg.Connection -> Pool Postgresql
