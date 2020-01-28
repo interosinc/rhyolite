@@ -22,6 +22,8 @@
 module Rhyolite.Frontend.App where
 
 import Control.Applicative
+import Control.Lens hiding (element, has)
+import Control.Lens.Combinators (ifoldl')
 import Control.Monad.Exception
 import Control.Monad.Identity
 import Control.Monad.Primitive
@@ -30,17 +32,13 @@ import Control.Monad.Ref
 import Control.Monad.State.Strict
 import Data.Aeson
 import qualified Data.Aeson as Aeson
-import Data.Aeson.Types
-import Data.Bifunctor
 import qualified Data.ByteString.Lazy as LBS
 import Data.Coerce (coerce)
-import Data.Constraint
 import Data.Constraint.Extras
 import Data.Default (Default)
-import Data.Functor.Sum
 import qualified Data.IntMap as IntMap
-import Data.Dependent.Map (DSum (..))
 import qualified Data.Map as Map
+import qualified Data.Map.Monoidal as MMap
 import Data.Semigroup ((<>))
 import Data.Some
 import Data.Text (Text)
@@ -299,17 +297,21 @@ runObeliskRhyoliteWidget ::
   , Additive qFrontend
   , Eq qWire
   , Monoid (QueryResult qFrontend)
-  , FromJSON (QueryResult qWire)
-  , FromJSONKey viewChannel
+  , FromJSON (Payload (QueryResult qWire))
   , ToJSON qWire
-  , ToJSONKey viewChannel
-  , Ord viewChannel
+  , Eq channelId
+  , Ord channelId
+  , FromJSONKey channelId
+  , ToJSONKey channelId
+  , Chunkable (QueryResult qWire)
+  , Eq (QueryResult qWire)
+  , Eq (Payload (QueryResult qWire))
   )
-  => QueryMorphism (ChannelQuery viewChannel qFrontend) (ChannelQuery viewChannel qWire)
+  => QueryMorphism qFrontend qWire
   -> Text -- ^ Typically "config/route", config file containing an http/https URL at which the backend will be served.
   -> Encoder Identity Identity (R (FullRoute backendRoute frontendRoute)) PageName -- ^ Checked route encoder
   -> R backendRoute -- ^ The "listen" backend route which is handled by the action produced by 'serveDbOverWebsockets'
-  -> RoutedT t (R frontendRoute) (RhyoliteWidget (ChannelQuery viewChannel qFrontend) req t m) a -- ^ Child widget
+  -> RoutedT t (R frontendRoute) (RhyoliteWidget (Channels channelId qFrontend) req t m) a -- ^ Child widget
   -> RoutedT t (R frontendRoute) m a
 runObeliskRhyoliteWidget toWire configRoute enc listenRoute child = do
   obR <- askRoute
@@ -322,7 +324,7 @@ runObeliskRhyoliteWidget toWire configRoute enc listenRoute child = do
   lift $ runPrerenderedRhyoliteWidget toWire wsUrl $ flip runRoutedT obR $ child
 
 runPrerenderedRhyoliteWidget
-   :: forall qFrontend qWire viewChannel req m t b x.
+   :: forall qFrontend qWire req m t b x channelId.
       ( PerformEvent t m
       , TriggerEvent t m
       , PostBuild t m
@@ -335,20 +337,24 @@ runPrerenderedRhyoliteWidget
       , Additive qFrontend
       , Eq qWire
       , Monoid (QueryResult qFrontend)
-      , FromJSON (QueryResult qWire)
-      , FromJSONKey viewChannel
+      , FromJSON (Payload (QueryResult qWire))
       , ToJSON qWire
-      , ToJSONKey viewChannel
-      , Ord viewChannel
+      , Eq channelId
+      , Ord channelId
+      , FromJSONKey channelId
+      , ToJSONKey channelId
+      , Chunkable (QueryResult qWire)
+      , Eq (QueryResult qWire)
+      , Eq (Payload (QueryResult qWire))
       )
-   => QueryMorphism (ChannelQuery viewChannel qFrontend) (ChannelQuery viewChannel qWire)
+   => QueryMorphism qFrontend qWire
    -> Text
-   -> RhyoliteWidget (ChannelQuery viewChannel qFrontend) req t m b
+   -> RhyoliteWidget (Channels channelId qFrontend) req t m b
    -> m b
 runPrerenderedRhyoliteWidget toWire url child = do
-  rec (notification :: Event t (ChannelView viewChannel qWire), response) <- fmap (bimap (switch . current) (switch . current) . splitDynPure) $
+  rec (notification :: Event t (Channels channelId (Chunk (QueryResult qWire))), response) <- fmap (bimap (switch . current) (switch . current) . splitDynPure) $
         prerender (return (never, never)) $ do
-          (appWebSocket :: AppWebSocket t (ChannelQuery viewChannel q)) <- openWebSocket' url request'' nubbedVs
+          (appWebSocket :: AppWebSocket t channelId q) <- openWebSocket' url request'' nubbedVs
           return ( _appWebSocket_notification appWebSocket
                  , _appWebSocket_response appWebSocket
                  )
@@ -357,9 +363,10 @@ runPrerenderedRhyoliteWidget toWire url child = do
             Success (v' :: (Some req)) -> Just $ TaggedRequest t v'
             _ -> Nothing)) request'
       ((a, vs), request) <- flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
-      let (vsDyn :: Dynamic t (ChannelQuery viewChannel qFrontend)) = incrementalToDynamic (vs :: Incremental t (AdditivePatch (ChannelQuery viewChannel qFrontend)))
-      nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
-      view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
+      let (vsDyn :: Dynamic t (Channels channelId qFrontend)) = incrementalToDynamic (vs :: Incremental t (AdditivePatch (Channels channelId qFrontend)))
+      nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire' <$> vsDyn)
+      aggregatedNotification :: Event t (Channels channelId (QueryResult qFrontend)) <- aggregateChunks notification
+      view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn aggregatedNotification
   return a
   where
     reqEncoder :: forall a. req a -> (Aeson.Value, Aeson.Value -> Maybe a)
@@ -369,12 +376,78 @@ runPrerenderedRhyoliteWidget toWire url child = do
         Success s-> Just s
         _ -> Nothing
       )
+    toWire' :: QueryMorphism (Channels channelId qFrontend) (Channels channelId qWire)
+    toWire' = QueryMorphism
+      { _queryMorphism_mapQuery = fmap (mapQuery toWire)
+      , _queryMorphism_mapQueryResult = fmap (mapQueryResult toWire)
+      }
+
+    aggregateChunks
+      :: Event t (Channels channelId (Chunk (QueryResult qWire)))
+      -> m (Event t (Channels channelId (QueryResult qFrontend)))
+    aggregateChunks messagePartial = do
+      pending :: Dynamic t (PendingMessages channelId qWire)
+        <- foldDyn addChunk mempty messagePartial
+      let message :: Event t (Channels channelId (QueryResult qFrontend))
+          message = ffor (updated pending) $ \(_, completed) ->
+            fmap (foldMap $ mapQueryResult toWire) completed
+      pure $ ffilter (not . MMap.null . unChannels) message
+      where
+        addChunk
+          :: Channels channelId (Chunk (QueryResult qWire))
+          -> PendingMessages channelId qWire
+          -> PendingMessages channelId qWire
+        addChunk currChunk (partial, _) =
+          ifoldl' addChunkSingleChannel (partial, mempty) (unChannels currChunk)
+        addChunkSingleChannel
+          :: channelId
+          -> PendingMessages channelId qWire
+          -> Chunk (QueryResult qWire)
+          -> PendingMessages channelId qWire
+        addChunkSingleChannel cid (Channels partial, Channels completed) chunk =
+          let messageId = _chunk_messageId chunk
+              partial' = partial & at cid . non mempty . at messageId . non [] %~ (:) (_chunk_payload chunk)
+              completed' =
+                let msg = (partial ^? payloadTraversal cid messageId . _Just) >>= (fromChunks . reverse)
+                 in completed & at cid . non mempty . at messageId .~ msg
+              pendingWithCompleted = 
+                  ( partial' & payloadTraversal cid messageId .~ Nothing
+                  , completed'
+                  )
+           in case _chunk_isFinalChunk chunk of
+                True  -> bimap Channels Channels pendingWithCompleted
+                False -> (Channels partial', Channels completed)
+
+-- Payloads are stored in the reverse of the order they were received.
+type PendingMessages channelId q =
+  ( Channels channelId (IntMap.IntMap [Payload (QueryResult q)]) -- Partial messages (still waiting for the last chunk to arrive)
+  , Channels channelId (IntMap.IntMap (QueryResult q)) -- Completed messages that have not been processed
+  )
+
+payloadTraversal
+  :: (Ord channelId)
+  => channelId
+  -> Int
+  -> Traversal'
+       (MMap.MonoidalMap channelId (IntMap.IntMap [p]))
+       (Maybe [p])
+payloadTraversal cid messageId = at cid . _Just . at messageId
 
 fromNotifications
-  :: forall m (t :: *) viewChannel q. (Ord viewChannel, Query q, MonadHold t m, PerformEvent t m, TriggerEvent t m, MonadIO (Performable m), Reflex t, MonadFix m, Monoid (QueryResult q))
-  => Dynamic t (ChannelQuery viewChannel q)
-  -> Event t (ChannelView viewChannel q)
-  -> m (Dynamic t (ChannelView viewChannel q))
+  :: forall m (t :: *) q channelId.
+     ( MonadFix m
+     , MonadHold t m
+     , MonadIO (Performable m)
+     , Monoid (QueryResult q)
+     , Ord channelId
+     , PerformEvent t m
+     , Query q
+     , Reflex t
+     , TriggerEvent t m
+     )
+  => Dynamic t (Channels channelId q)
+  -> Event t (Channels channelId (QueryResult q))
+  -> m (Dynamic t (Channels channelId (QueryResult q)))
 fromNotifications vs ePatch = do
   ePatchThrottled <- throttleBatchWithLag lag ePatch
   foldDyn (\(vs', p) v -> cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
@@ -383,8 +456,8 @@ fromNotifications vs ePatch = do
 
 data Decoder f = forall a. FromJSON a => Decoder (f a)
 
-data AppWebSocket t q = AppWebSocket
-  { _appWebSocket_notification :: Event t (QueryResult q)
+data AppWebSocket t channelId q = AppWebSocket
+  { _appWebSocket_notification :: Event t (Channels channelId (Chunk (QueryResult q)))
   , _appWebSocket_response :: Event t TaggedResponse
   , _appWebSocket_version :: Event t Text
   , _appWebSocket_connected :: Dynamic t Bool
@@ -392,7 +465,7 @@ data AppWebSocket t q = AppWebSocket
 
 -- | Open a websocket connection and split resulting incoming traffic into listen notification and api response channels
 openWebSocket' 
-  :: forall r q t x m.
+  :: forall r q t x m channelId.
      ( MonadJSM m
      , MonadJSM (Performable m)
      , PostBuild t m
@@ -402,14 +475,17 @@ openWebSocket'
      , HasJS x m
      , MonadFix m
      , MonadHold t m
-     , FromJSON (QueryResult q)
+     , FromJSON (Payload (QueryResult q))
      , ToJSON q
      , Request r
+     , Ord channelId
+     , FromJSONKey channelId
+     , ToJSONKey channelId
      )
   => Text -- ^ A complete URL
   -> Event t [TaggedRequest r] -- ^ Outbound requests
-  -> Dynamic t q -- ^ Authenticated listen requests (e.g., ViewSelector updates)
-  -> m (AppWebSocket t q)
+  -> Dynamic t (Channels channelId q) -- ^ Authenticated listen requests (e.g., ViewSelector updates)
+  -> m (AppWebSocket t channelId q)
 openWebSocket' url request vs = do
 #if defined(ghcjs_HOST_OS)
   rec let platformDecode = jsonDecode . pFromJSVal
@@ -421,13 +497,13 @@ openWebSocket' url request vs = do
 #endif
         & webSocketConfig_send .~ fmap (map (decodeUtf8 . LBS.toStrict . Aeson.encode)) (mconcat
           [ fmap (map WebSocketRequest_Api) request
-          , fmap ((:[]) . WebSocketRequest_ViewSelector) $ updated vs :: Event t [WebSocketRequest q r]
+          , fmap ((:[]) . WebSocketRequest_ViewSelector) $ updated vs :: Event t [WebSocketRequest (Channels channelId q) r]
           -- NB: It's tempting to try to only send query diffs here, but this must be treated
           -- with care, since the backend needs to know when we cease being interested in things
           -- so that it knows not to send further notifications.
           , tag (fmap ((:[]) . WebSocketRequest_ViewSelector) $ current vs) $ _webSocket_open ws
           ])
-  let (eMessages :: Event t (WebSocketResponse q)) = fmapMaybe platformDecode $ _webSocket_recv ws
+  let (eMessages :: Event t (WebSocketResponse channelId q)) = fmapMaybe platformDecode $ _webSocket_recv ws
       notification = fforMaybe eMessages $ \case
         WebSocketResponse_View v -> Just v
         _ -> Nothing
@@ -446,7 +522,7 @@ openWebSocket' url request vs = do
     }
 
 openWebSocket 
-  :: forall t x m r q.
+  :: forall t x m r q channelId.
      ( MonadJSM m
      , MonadJSM (Performable m)
      , PostBuild t m
@@ -457,13 +533,16 @@ openWebSocket
      , MonadFix m
      , MonadHold t m
      , Request r
-     , FromJSON (QueryResult q)
+     , FromJSON (Payload (QueryResult q))
      , ToJSON q
+     , Ord channelId
+     , FromJSONKey channelId
+     , ToJSONKey channelId
      )
   => Text -- ^ A complete URL
   -> Event t [TaggedRequest r] -- ^ Outbound requests
-  -> Dynamic t q -- ^ current ViewSelector
-  -> m ( Event t (QueryResult q)
+  -> Dynamic t (Channels channelId q) -- ^ current ViewSelector
+  -> m ( Event t (Channels channelId (Chunk (QueryResult q)))
        , Event t TaggedResponse
        )
 openWebSocket murl request vs = do

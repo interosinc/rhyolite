@@ -38,6 +38,7 @@ library
     , lens
     , mmorph
     , monad-control
+    , monoidal-containers
     , mtl
     , network-uri
     , obelisk-route

@@ -19,12 +19,12 @@ module Rhyolite.Backend.App
 
 import Control.Category (Category)
 import qualified Control.Category as Cat
+import Control.Concurrent.MVar (modifyMVar, newMVar)
 import Control.Exception (SomeException(..), bracket, try)
-import Control.Lens (imapM_)
+import Control.Lens (imapM_, ifor_)
 import Control.Monad
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Aeson (FromJSON, ToJSON, toJSON)
-import Data.Aeson.Text (encodeToLazyText)
+import Data.Aeson (FromJSON, FromJSONKey, ToJSON, ToJSONKey, toJSON)
 import Data.Align
 import Data.Constraint.Extras
 import Data.Map.Monoidal (MonoidalMap)
@@ -36,9 +36,7 @@ import Data.Pool (Pool)
 import Data.Semigroup (Semigroup, (<>))
 import Data.Some (Some(Some))
 import Data.Text (Text)
-import qualified Data.Text as T
 import qualified Data.Text.IO as T
-import qualified Data.Text.Lazy as TL
 import Data.Typeable (Typeable)
 import Data.Witherable (Filterable(..))
 import Debug.Trace (trace)
@@ -60,7 +58,7 @@ import Rhyolite.Concurrent
 import Rhyolite.Sign (Signed)
 import Rhyolite.Backend.WebSocket (withWebsocketsConnection, getDataMessage, sendEncodedDataMessage)
 import Rhyolite.Backend.Sign (readSignedWithKey)
-import Rhyolite.WebSocket (Channels(..), Chunk(..), TaggedRequest (..), TaggedResponse (..), WebSocketResponse (..), WebSocketRequest (..), toChunks)
+import Rhyolite.WebSocket (Chunk(..), Chunkable(..), Channels(..), Payload, TaggedRequest (..), TaggedResponse (..), WebSocketResponse (..), WebSocketRequest (..), toChunks)
 
 -- | This query morphism translates between un-annotated queries for use over the wire, and ones with SelectedCount annotations used in the backend to be able to determine the differences between queries. This version is for use with the older Functor style of queries and results.
 functorFromWire
@@ -247,19 +245,23 @@ multiplexQuery lookupQueryHandler = do
 
 -- | Like 'handleWebsocketConnection' but customized for 'Snap'.
 handleWebsocket
-  :: forall r q qWire.
+  :: forall r q qWire channelId.
      ( Request r
      , Eq (QueryResult q)
      , Monoid (QueryResult q)
      , ToJSON (QueryResult qWire)
      , FromJSON qWire
+     , FromJSONKey channelId
+     , ToJSONKey channelId
      , Monoid q
      , Query q
+     , Ord channelId
+     , Chunkable (QueryResult qWire)
      )
   => Text -- ^ Version
   -> QueryMorphism qWire q -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
   -> RequestHandler r IO -- ^ Handler for API requests
-  -> Registrar q
+  -> Registrar (Channels channelId q)
   -> Snap ()
 handleWebsocket v fromWire rh register = withWebsocketsConnection (handleWebsocketConnection v fromWire rh register)
 
@@ -270,40 +272,63 @@ handleWebsocketConnection
     , Eq (QueryResult q)
     , ToJSON (QueryResult qWire)
     , FromJSON qWire
+    , FromJSONKey channelId
+    , ToJSONKey channelId
     , Monoid q
     , Query q
+    , Ord channelId
+    , Chunkable (QueryResult qWire)
     )
   => Text -- ^ Version
-  -> QueryMorphism (Channels channelId qWire) (Channels channelId q) -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
+  -> QueryMorphism qWire q -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
   -> RequestHandler r IO -- ^ Handler for API requests
-  -> Registrar q
+  -> Registrar (Channels channelId q)
   -> WS.Connection
   -> IO ()
 handleWebsocketConnection v fromWire rh register conn = do
-  let sender = Recipient $ sendEncodedDataMessage conn . (\a -> WebSocketResponse_View (_queryMorphism_mapQueryResult fromWire a) :: WebSocketResponse qWire)
-  sendEncodedDataMessage conn (WebSocketResponse_Version v :: WebSocketResponse qWire)
-  -- TODO implement channel-based queuing of web socket messages
-  bracket (unRegistrar register sender) snd $ \(vsHandler, _) -> forever $ do
-    (wsr :: WebSocketRequest qWire r) <- liftIO $ getDataMessage conn
+  nextMessageId <- newMVar 0
+  let getNextMessageId = modifyMVar nextMessageId (\curr -> pure (curr+1, curr))
+      sender :: Recipient (Channels channelId q) IO = Recipient $ \qr -> do
+        let qrWire :: Channels channelId (QueryResult qWire) = _queryMorphism_mapQueryResult fromWire' qr
+        ifor_ (unChannels qrWire) $ \channelId currResult -> do
+          messageId <- getNextMessageId
+          sendChunks channelId messageId (toChunks currResult)
+  sendEncodedDataMessage conn (WebSocketResponse_Version v :: WebSocketResponse channelId qWire)
+  bracket (unRegistrar register sender) snd $ \(vsHandler :: QueryHandler (Channels channelId q) IO, _) -> forever $ do
+    (wsr :: WebSocketRequest (Channels channelId qWire) r) <- liftIO $ getDataMessage conn
     case wsr of
       WebSocketRequest_Api (TaggedRequest reqId (Some req)) -> do
         a <- runRequestHandler rh req
         sendEncodedDataMessage conn
-          (WebSocketResponse_Api $ TaggedResponse reqId (has @ToJSON req (toJSON a)) :: WebSocketResponse qWire)
-      WebSocketRequest_ViewSelector new -> do
-        Channels qr <- runQueryHandler vsHandler (_queryMorphism_mapQuery fromWire new)
-        void $ flip Map.traverseWithKey qr $ \channelId channelResult -> do
-          let (payloads, numChunks) = toChunks channelResult
-              mkChunk i payload = Chunk
-                { _chunk_number = i
-                , _chunk_totalChunks = numChunks
-                , _chunk_payload = TL.toStrict $ encodeToLazyText payload
-                }
-              chunks = zipWith mkChunk [1..] payloads
-          forM_ chunks $ \c -> do
-            let c' = Map.singleton channelId c
-            -- TODO write to queue instead of immediately sending
-            sendEncodedDataMessage conn (WebSocketResponse_View c')
+          (WebSocketResponse_Api $ TaggedResponse reqId (has @ToJSON req (toJSON a)) :: WebSocketResponse channelId qWire)
+      WebSocketRequest_ViewSelector (new :: Channels channelId qWire) -> do
+        ifor_ (unChannels new) $ \channelId currQuery -> do
+          let currQuery' = Channels $ Map.singleton channelId currQuery
+          qr :: (Channels channelId (QueryResult q)) <- runQueryHandler vsHandler (_queryMorphism_mapQuery fromWire' currQuery')
+          ifor_ (unChannels qr) $ \respChannelId currResult -> do
+            messageId <- getNextMessageId
+            sendChunks respChannelId messageId (toChunks $ _queryMorphism_mapQueryResult fromWire currResult)
+  where
+    sendChunks :: channelId -> Int -> [Payload (QueryResult qWire)] -> IO ()
+    sendChunks _ _ [] = pure ()
+    sendChunks channelId messageId (x:xs) = do
+      let chunk = Chunk { _chunk_messageId = messageId
+                        , _chunk_isFinalChunk = null xs
+                        , _chunk_payload = x
+                        }
+      sendChunk channelId chunk
+      sendChunks channelId messageId xs
+
+    sendChunk :: channelId -> Chunk (QueryResult qWire) -> IO ()
+    sendChunk channelId c = do
+      let qr = Channels $ Map.singleton channelId c
+      sendEncodedDataMessage conn (WebSocketResponse_View qr :: WebSocketResponse channelId qWire)
+
+    fromWire' :: QueryMorphism (Channels channelId qWire) (Channels channelId q)
+    fromWire' = QueryMorphism
+      { _queryMorphism_mapQuery = fmap (mapQuery fromWire)
+      , _queryMorphism_mapQueryResult = fmap (mapQueryResult fromWire)
+      }
 
 -------------------------------------------------------------------------------
 
@@ -344,16 +369,20 @@ connectPipelineToWebsockets
      , Eq (QueryResult q)
      , FromJSON qWire
      , ToJSON (QueryResult qWire)
+     , FromJSONKey channelId
+     , ToJSONKey channelId
      , Query q
      , Group q
+     , Ord channelId
+     , Chunkable (QueryResult qWire)
      )
   => Text -- ^ Version
   -> QueryMorphism qWire q -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
   -> RequestHandler r IO
   -- ^ API handler
-  -> QueryHandler (MonoidalMap ClientKey q) IO
+  -> QueryHandler (MonoidalMap ClientKey (Channels channelId q)) IO
   -- ^ A way to retrieve more data for each consumer
-  -> IO (Recipient (MonoidalMap ClientKey q) IO, Snap ())
+  -> IO (Recipient (MonoidalMap ClientKey (Channels channelId q)) IO, Snap ())
   -- ^ A way to send data to many consumers and a handler for websockets connections
 connectPipelineToWebsockets = connectPipelineToWebsocketsRaw withWebsocketsConnection
 
@@ -364,17 +393,21 @@ connectPipelineToWebsocketsRaw
      , Eq (QueryResult q)
      , FromJSON qWire
      , ToJSON (QueryResult qWire)
+     , FromJSONKey channelId
+     , ToJSONKey channelId
      , Query q
      , Group q
+     , Ord channelId
+     , Chunkable (QueryResult qWire)
      )
   => ((WS.Connection -> IO ()) -> m a) -- ^ Websocket handler
   -> Text -- ^ Version
   -> QueryMorphism qWire q -- ^ Query morphism to translate between wire queries and queries with a reasonable group instance. cf. functorFromWire, vesselFromWire
   -> RequestHandler r IO
   -- ^ API handler
-  -> QueryHandler (MonoidalMap ClientKey q) IO
+  -> QueryHandler (MonoidalMap ClientKey (Channels channelId q)) IO
   -- ^ A way to retrieve more data for each consumer
-  -> IO (Recipient (MonoidalMap ClientKey q) IO, m a)
+  -> IO (Recipient (MonoidalMap ClientKey (Channels channelId q)) IO, m a)
   -- ^ A way to send data to many consumers and a handler for websockets connections
 connectPipelineToWebsocketsRaw withWsConn ver fromWire rh qh = do
   (allRecipients, registerRecipient) <- connectPipelineToWebsockets' qh
@@ -422,13 +455,17 @@ serveDbOverWebsockets
      , Group q'
      , Additive q'
      , PositivePart q'
+     , FromJSONKey channelId
+     , ToJSONKey channelId
+     , Ord channelId
+     , Chunkable (QueryResult qWire)
      )
   => Pool Postgresql
   -> RequestHandler r IO
   -> (notifyMessage -> q' -> IO (QueryResult q'))
   -> QueryHandler q' IO
   -> QueryMorphism qWire q
-  -> Pipeline IO (MonoidalMap ClientKey q) q'
+  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) q'
   -> IO (Snap (), IO ())
 serveDbOverWebsockets pool rh nh qh fromWire pipeline = do
   mver <- try (T.readFile "version")
@@ -436,7 +473,7 @@ serveDbOverWebsockets pool rh nh qh fromWire pipeline = do
   serveDbOverWebsocketsRaw withWebsocketsConnection version fromWire pool rh nh qh pipeline
 
 serveDbOverWebsocketsRaw
-  :: forall notifyMessage qWire q q' r m a.
+  :: forall notifyMessage qWire q q' r m a channelId.
      ( Request r
      , FromJSON qWire
      , ToJSON (QueryResult qWire)
@@ -453,6 +490,10 @@ serveDbOverWebsocketsRaw
      , Group q'
      , Additive q'
      , PositivePart q'
+     , FromJSONKey channelId
+     , ToJSONKey channelId
+     , Ord channelId
+     , Chunkable (QueryResult qWire)
      )
   => ((WS.Connection -> IO ()) -> m a)
   -> Text -- ^ version
@@ -461,16 +502,16 @@ serveDbOverWebsocketsRaw
   -> RequestHandler r IO
   -> (notifyMessage -> q' -> IO (QueryResult q'))
   -> QueryHandler q' IO
-  -> Pipeline IO (MonoidalMap ClientKey q) q'
+  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) q'
   -> IO (m a, IO ())
 serveDbOverWebsocketsRaw withWsConn version fromWire db handleApi handleNotify handleQuery pipe = do
   (getNextNotification :: IO notifyMessage, finalizeListener :: IO ()) <-
     startNotificationListener db
   rec (qh :: QueryHandler q' IO, finalizeFeed :: IO ()) <-
         feedPipeline (handleNotify <$> getNextNotification) handleQuery r
-      (qh' :: QueryHandler (MonoidalMap ClientKey q) IO, r :: Recipient q' IO) <-
+      (qh' :: QueryHandler (MonoidalMap ClientKey (Channels channelId q)) IO, r :: Recipient q' IO) <-
         unPipeline pipe qh r'
-      (r' :: Recipient (MonoidalMap ClientKey q) IO, handleListen :: m a) <-
+      (r' :: Recipient (MonoidalMap ClientKey (Channels channelId q)) IO, handleListen :: m a) <-
         connectPipelineToWebsocketsRaw withWsConn version fromWire handleApi qh'
   return (handleListen, finalizeFeed >> finalizeListener)
 

@@ -38,13 +38,14 @@ instance (FromJSON q, FromJSON (Some r)) => FromJSON (WebSocketRequest q r)
 instance (ToJSON q, ToJSON (Some r)) => ToJSON (WebSocketRequest q r)
 
 -- | Represents a WebSocket response from one of three channels: incoming 'View's, API responses, or version info
-data WebSocketResponse q = WebSocketResponse_View (QueryResult q)
-                         | WebSocketResponse_Api TaggedResponse
-                         | WebSocketResponse_Version Text
+data WebSocketResponse channelId q
+  = WebSocketResponse_View (Channels channelId (Chunk (QueryResult q)))
+  | WebSocketResponse_Api TaggedResponse
+  | WebSocketResponse_Version Text
   deriving (Typeable, Generic)
 
-instance FromJSON (QueryResult q) => FromJSON (WebSocketResponse q)
-instance ToJSON (QueryResult q) => ToJSON (WebSocketResponse q)
+instance (Ord channelId, FromJSONKey channelId, FromJSON (Payload (QueryResult q))) => FromJSON (WebSocketResponse channelId q)
+instance (Ord channelId, ToJSONKey channelId, ToJSON (Payload (QueryResult q))) => ToJSON (WebSocketResponse channelId q)
 
 -- | A request tagged with an identifier
 data TaggedRequest r = TaggedRequest Int (Some r)
@@ -61,7 +62,7 @@ instance FromJSON TaggedResponse
 instance ToJSON TaggedResponse
 
 newtype Channels channelId a = Channels { unChannels :: MonoidalMap channelId a }
-  deriving (Typeable, Generic)
+  deriving (Typeable, Generic, Functor)
 
 deriving instance (Eq channelId, Eq q) => Eq (Channels channelId q)
 deriving instance (Ord channelId, Semigroup q) => Semigroup (Channels channelId q)
@@ -75,30 +76,18 @@ instance (Ord channelId, Query q) => Query (Channels channelId q) where
   type QueryResult (Channels channelId q) = Channels channelId (QueryResult q)
   crop (Channels q) (Channels v) = Channels $ crop q v
 
--- newtype ChannelView channelId q = ChannelView { unChannelView :: MonoidalMap channelId (QueryResult q) }
---   deriving (Typeable, Generic)
-
--- newtype ChannelViewChunk channelId q = ChannelViewChunk { unChannelViewChunk :: MonoidalMap channelId (Chunk (QueryResult q)) }
---   deriving (Typeable, Generic)
-
--- deriving instance (Eq channelId, Eq (QueryResult q)) => Eq (ChannelView channelId q)
--- deriving instance (Ord channelId, Semigroup (QueryResult q)) => Semigroup (ChannelView channelId q)
--- deriving instance (Ord channelId, Monoid (QueryResult q)) => Monoid (ChannelView channelId q)
--- deriving instance (Ord channelId, Additive (QueryResult q)) => Additive (ChannelView channelId q)
--- deriving instance (Ord channelId, Group (QueryResult q)) => Group (ChannelView channelId q)
--- deriving instance (ToJSONKey channelId, ToJSON (QueryResult q)) => ToJSON (ChannelView channelId q)
--- deriving instance (Ord channelId, FromJSONKey channelId, FromJSON (QueryResult q)) => FromJSON (ChannelView channelId q)
-
--- instance (Ord channelId, Query q) => Query (ChannelQuery channelId q) where
---   type QueryResult (ChannelQuery channelId q) = ChannelView channelId q
---   crop (ChannelQuery vs) (ChannelView v) = ChannelView $ crop vs v
-
 class (ToJSON (Payload a)) => Chunkable a where
   type Payload a :: *
-  toChunks :: a -> ([Payload a], Int)
+  toChunks :: a -> [Payload a]
+  -- | Reconstruct a value from multiple chunks if possible.
+  fromChunks :: [Payload a] -> Maybe a
 
 data Chunk a = Chunk
-  { _chunk_number      :: {-# UNPACK #-} !Int
-  , _chunk_totalChunks :: {-# UNPACK #-} !Int
-  , _chunk_payload     :: !(Payload a)
+  { _chunk_messageId    :: {-# UNPACK #-} !Int
+  , _chunk_isFinalChunk :: !Bool
+  , _chunk_payload      :: !(Payload a)
   }
+  deriving (Typeable, Generic)
+
+instance FromJSON (Payload a) => FromJSON (Chunk a)
+instance ToJSON (Payload a) => ToJSON (Chunk a)
