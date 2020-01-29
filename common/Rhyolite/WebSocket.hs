@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -19,6 +20,8 @@ import GHC.Generics
 import Network.URI (URI(..))
 import Reflex.Patch
 import Reflex.Query.Class
+
+import Rhyolite.App
 
 websocketUri :: URI -> URI
 websocketUri uri = uri
@@ -62,13 +65,14 @@ instance FromJSON TaggedResponse
 instance ToJSON TaggedResponse
 
 newtype Channels channelId a = Channels { unChannels :: MonoidalMap channelId a }
-  deriving (Typeable, Generic, Functor)
+  deriving (Typeable, Generic, Functor, Traversable, Foldable)
 
 deriving instance (Eq channelId, Eq q) => Eq (Channels channelId q)
 deriving instance (Ord channelId, Semigroup q) => Semigroup (Channels channelId q)
 deriving instance (Ord channelId, Monoid q) => Monoid (Channels channelId q)
 deriving instance (Ord channelId, Additive q) => Additive (Channels channelId q)
 deriving instance (Ord channelId, Group q) => Group (Channels channelId q)
+deriving instance (PositivePart q) => PositivePart (Channels channelId q)
 deriving instance (ToJSONKey channelId, ToJSON q) => ToJSON (Channels channelId q)
 deriving instance (Ord channelId, FromJSONKey channelId, FromJSON q) => FromJSON (Channels channelId q)
 

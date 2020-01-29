@@ -129,7 +129,8 @@ newtype Registrar q = Registrar { unRegistrar :: Recipient q IO -> IO (QueryHand
 --
 -- q is the consumer side
 -- q' is the datasource side
-newtype Pipeline m q q' = Pipeline { unPipeline :: QueryHandler q' m -> Recipient q m -> IO (QueryHandler q m, Recipient q' m) }
+newtype Pipeline m q q' = Pipeline
+  { unPipeline :: QueryHandler q' m -> Recipient q m -> IO (QueryHandler q m, Recipient q' m) }
 
 tracePipelineQuery :: (Show q, Show (QueryResult q)) => String -> Pipeline IO q q
 tracePipelineQuery tag = Pipeline $ \qh r -> do
@@ -337,27 +338,29 @@ handleWebsocketConnection v fromWire rh register conn = do
 -- Data taken from 'getNextNotification' is pushed into the pipeline and
 -- when the pipeline pulls data, it is retrieved using 'qh'
 feedPipeline
-  :: (Group q, Additive q, PositivePart q, Monoid (QueryResult q))
+  :: forall q channelId. (Ord channelId, Group q, Additive q, PositivePart q, Monoid (QueryResult q))
   => IO (q -> IO (QueryResult q))
   -- ^ Get the next notification to be sent to the pipeline. If no notification
   -- is available, this should block until one is available
   -> QueryHandler q IO
   -- ^ Retrieve data when requested by pipeline
-  -> Recipient q IO
+  -> Recipient (Channels channelId q) IO
   -- ^ A way to push data into the pipeline
-  -> IO (QueryHandler q IO, IO ())
+  -> IO (QueryHandler (Channels channelId q) IO, IO ())
   -- ^ A way for the pipeline to request data
 feedPipeline getNextNotification qh r = do
   currentQuery <- newIORef mempty
-  let qhSaveQuery = QueryHandler $ \new -> do
+  let qh' :: QueryHandler (Channels channelId  q) IO =
+        QueryHandler $ mapM (runQueryHandler qh)
+      qhSaveQuery :: QueryHandler (Channels channelId q) IO = QueryHandler $ \new -> do
         atomicModifyIORef' currentQuery $ \old -> (new <> old, ())
         case positivePart new of
           Nothing -> return mempty
-          Just q -> runQueryHandler qh q
+          Just q  -> runQueryHandler qh' q
   tid <- worker 10000 $ do
-    nm <- getNextNotification
+    getNext <- getNextNotification
     q <- readIORef currentQuery
-    qr <- nm q
+    qr <- mapM getNext q
     tellRecipient r qr
   return (qhSaveQuery, tid)
 
@@ -465,7 +468,7 @@ serveDbOverWebsockets
   -> (notifyMessage -> q' -> IO (QueryResult q'))
   -> QueryHandler q' IO
   -> QueryMorphism qWire q
-  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) q'
+  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) (Channels channelId q')
   -> IO (Snap (), IO ())
 serveDbOverWebsockets pool rh nh qh fromWire pipeline = do
   mver <- try (T.readFile "version")
@@ -502,14 +505,14 @@ serveDbOverWebsocketsRaw
   -> RequestHandler r IO
   -> (notifyMessage -> q' -> IO (QueryResult q'))
   -> QueryHandler q' IO
-  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) q'
+  -> Pipeline IO (MonoidalMap ClientKey (Channels channelId q)) (Channels channelId q')
   -> IO (m a, IO ())
 serveDbOverWebsocketsRaw withWsConn version fromWire db handleApi handleNotify handleQuery pipe = do
   (getNextNotification :: IO notifyMessage, finalizeListener :: IO ()) <-
     startNotificationListener db
-  rec (qh :: QueryHandler q' IO, finalizeFeed :: IO ()) <-
+  rec (qh :: QueryHandler (Channels channelId q') IO, finalizeFeed :: IO ()) <- do
         feedPipeline (handleNotify <$> getNextNotification) handleQuery r
-      (qh' :: QueryHandler (MonoidalMap ClientKey (Channels channelId q)) IO, r :: Recipient q' IO) <-
+      (qh' :: QueryHandler (MonoidalMap ClientKey (Channels channelId q)) IO, r :: Recipient (Channels channelId q') IO) <-
         unPipeline pipe qh r'
       (r' :: Recipient (MonoidalMap ClientKey (Channels channelId q)) IO, handleListen :: m a) <-
         connectPipelineToWebsocketsRaw withWsConn version fromWire handleApi qh'
