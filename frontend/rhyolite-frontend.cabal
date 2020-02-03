@@ -27,6 +27,7 @@ library
     , cookie
     , data-default
     , dependent-map
+    , dependent-monoidal-map
     , dependent-sum
     , either
     , exception-transformers

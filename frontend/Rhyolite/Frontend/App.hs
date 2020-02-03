@@ -37,10 +37,12 @@ import Data.Coerce (coerce)
 import Data.Constraint
 import Data.Constraint.Extras
 import Data.Default (Default)
+import Data.Dependent.Map.Monoidal (MonoidalDMap(..))
 import Data.Functor.Sum
 import qualified Data.IntMap as IntMap
-import Data.Dependent.Map (DSum (..))
+import Data.Dependent.Map (DSum (..), DMap(..))
 import qualified Data.Map as Map
+import Data.GADT.Compare
 import Data.Semigroup ((<>))
 import Data.Some
 import Data.Text (Text)
@@ -374,6 +376,33 @@ fromNotifications vs ePatch = do
   foldDyn (\(vs', p) v -> cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
   where
     lag e = performEventAsync $ ffor e $ \a cb -> liftIO $ cb a
+
+fromNotifications'
+  :: forall m (t :: *) (q :: ((* -> *) -> *) -> *) cred.
+     ( GCompare q
+     , MonadFix m
+     , MonadHold t m
+     , MonadIO (Performable m)
+     -- , Monoid (QueryResult q)
+     , Ord cred
+     , PerformEvent t m
+     -- , Query q
+     , Reflex t
+     , TriggerEvent t m
+     )
+  => Dynamic t (SubVessel cred (Vessel q) (Const SelectedCount))
+  -> Event t (SubVessel cred (Vessel q) Identity)
+  -> m (Dynamic t (SubVessel cred (Vessel q) (Dynamic t)))
+fromNotifications' vs ePatch = do
+  -- ePatchThrottled <- throttleBatchWithLag lag ePatch
+  let ePatchSelector = fanG $ fmap getDMap ePatch
+  -- foldDyn (\(vs', p :: SubVessel cred (Vessel q) Identity) v -> cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
+  undefined
+  where
+    lag e = performEventAsync $ ffor e $ \a cb -> liftIO $ cb a
+
+    -- getDMap :: SubVessel cred (Vessel q) Identity -> DMap (SubVesselKey cred (Vessel q)) (FlipAp Identity)
+    getDMap = unMonoidalDMap . unVessel . unSubVessel
 
 data Decoder f = forall a. FromJSON a => Decoder (f a)
 
