@@ -342,7 +342,7 @@ runPrerenderedRhyoliteWidget
 runPrerenderedRhyoliteWidget toWire url child = do
   rec (notification :: Event t (QueryResult qWire), response) <- {-# SCC "notification" #-} fmap (bimap (switch . current) (switch . current) . splitDynPure) $
         prerender (return (never, never)) $ {-# SCC "prerender.client" #-} do
-          (appWebSocket :: AppWebSocket t q) <- openWebSocket' url request'' nubbedVs
+          (appWebSocket :: AppWebSocket t q) <- openWebSocket' url request'' $ constDyn $ mapQuery toWire mempty
           return ( _appWebSocket_notification appWebSocket
                  , _appWebSocket_response appWebSocket
                  )
@@ -350,10 +350,10 @@ runPrerenderedRhyoliteWidget toWire url child = do
       let request'' = fmap ({-# SCC "request''_fmap_f" #-} Map.elems . Map.mapMaybeWithKey (\t v -> case fromJSON v of
             Success (v' :: (Some req)) -> Just $ TaggedRequest t v'
             _ -> Nothing)) request'
-      ((a, vs), request) <- {-# SCC "run" #-} flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
-      let (vsDyn :: Dynamic t qFrontend) = incrementalToDynamic (vs :: Incremental t (AdditivePatch qFrontend))
-      nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
-      view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
+      ((a, _), request) <- {-# SCC "run" #-} flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
+      -- let (vsDyn :: Dynamic t qFrontend) = incrementalToDynamic (vs :: Incremental t (AdditivePatch qFrontend))
+      -- nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
+      let view = constDyn mempty -- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
   return a
   where
     reqEncoder :: forall a. req a -> (Aeson.Value, Aeson.Value -> Maybe a)
