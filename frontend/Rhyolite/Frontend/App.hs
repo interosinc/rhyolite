@@ -340,17 +340,17 @@ runPrerenderedRhyoliteWidget
    -> RhyoliteWidget qFrontend req t m b
    -> m b
 runPrerenderedRhyoliteWidget toWire url child = do
-  rec (notification :: Event t (QueryResult qWire), response) <- fmap (bimap (switch . current) (switch . current) . splitDynPure) $
-        prerender (return (never, never)) $ do
+  rec (notification :: Event t (QueryResult qWire), response) <- {-# SCC "notification" #-} fmap (bimap (switch . current) (switch . current) . splitDynPure) $
+        prerender (return (never, never)) $ {-# SCC "prerender.client" #-} do
           (appWebSocket :: AppWebSocket t q) <- openWebSocket' url request'' nubbedVs
           return ( _appWebSocket_notification appWebSocket
                  , _appWebSocket_response appWebSocket
                  )
-      (request', response') <- matchResponsesWithRequests reqEncoder request $ ffor response $ \(TaggedResponse t v) -> (t, v)
-      let request'' = fmap (Map.elems . Map.mapMaybeWithKey (\t v -> case fromJSON v of
+      (request', response') <- {-# SCC "matchResponsesWithRequests" #-} matchResponsesWithRequests reqEncoder request $ ffor response $ \(TaggedResponse t v) -> (t, v)
+      let request'' = fmap ({-# SCC "request''_fmap_f" #-} Map.elems . Map.mapMaybeWithKey (\t v -> case fromJSON v of
             Success (v' :: (Some req)) -> Just $ TaggedRequest t v'
             _ -> Nothing)) request'
-      ((a, vs), request) <- flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
+      ((a, vs), request) <- {-# SCC "run" #-} flip runRequesterT (fmapMaybe (traverseRequesterData (fmap Identity)) response') $ runQueryT (unRhyoliteWidget child) view
       let (vsDyn :: Dynamic t qFrontend) = incrementalToDynamic (vs :: Incremental t (AdditivePatch qFrontend))
       nubbedVs <- holdUniqDyn (_queryMorphism_mapQuery toWire <$> vsDyn)
       view <- fmap join $ prerender (pure mempty) $ fromNotifications vsDyn $ _queryMorphism_mapQueryResult toWire <$> notification
@@ -371,7 +371,7 @@ fromNotifications
   -> m (Dynamic t (QueryResult q))
 fromNotifications vs ePatch = do
   ePatchThrottled <- throttleBatchWithLag lag ePatch
-  foldDyn (\(vs', p) v -> cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
+  foldDyn (\(vs', p) v -> {-# SCC "cropViewAndMappend" #-} cropView vs' $ p <> v) mempty $ attach (current vs) ePatchThrottled
   where
     lag e = performEventAsync $ ffor e $ \a cb -> liftIO $ cb a
 
@@ -421,7 +421,7 @@ openWebSocket' url request vs = do
           -- so that it knows not to send further notifications.
           , tag (fmap ((:[]) . WebSocketRequest_ViewSelector) $ current vs) $ _webSocket_open ws
           ])
-  let (eMessages :: Event t (WebSocketResponse q)) = fmapMaybe platformDecode $ _webSocket_recv ws
+  let (eMessages :: Event t (WebSocketResponse q)) = {-# SCC "fmapMaybe_platformDecode" #-} fmapMaybe platformDecode $ _webSocket_recv ws
       notification = fforMaybe eMessages $ \case
         WebSocketResponse_View v -> Just v
         _ -> Nothing
