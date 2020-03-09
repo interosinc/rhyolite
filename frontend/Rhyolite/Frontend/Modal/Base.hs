@@ -32,6 +32,7 @@ import qualified GHCJS.DOM as DOM
 import qualified GHCJS.DOM.EventM as EventM
 import qualified GHCJS.DOM.GlobalEventHandlers as Events
 import Language.Javascript.JSaddle (MonadJSM)
+import Obelisk.Frontend.Cookie
 import Obelisk.Route.Frontend
 import Reflex.Dom.Core
 import Reflex.Host.Class (MonadReflexCreateTrigger)
@@ -50,6 +51,7 @@ newtype ModalT t modalM m a
     , DomBuilder t, NotReady t, MonadHold t, MonadSample t
     , PerformEvent t, TriggerEvent t, PostBuild t, HasJS x
     , MonadReflexCreateTrigger t, MonadQuery t q, Requester t
+    , HasCookies
     )
 
 instance PrimMonad m => PrimMonad (ModalT t modalM m) where

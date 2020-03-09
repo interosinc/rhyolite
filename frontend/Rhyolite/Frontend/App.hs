@@ -61,6 +61,7 @@ import Rhyolite.App
 import Rhyolite.WebSocket
 
 import Obelisk.Configs
+import Obelisk.Frontend.Cookie
 import Obelisk.Route hiding (Decoder)
 import Obelisk.Route.Frontend hiding (Decoder)
 
@@ -108,7 +109,7 @@ vesselToWire = QueryMorphism
 type RhyoliteWidgetInternal q r t m = QueryT t q (RequesterT t r Identity m)
 
 newtype RhyoliteWidget q r t m a = RhyoliteWidget { unRhyoliteWidget :: RhyoliteWidgetInternal q r t m a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, HasCookies)
 
 deriving instance ( Group q
                   , Additive q
