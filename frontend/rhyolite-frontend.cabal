@@ -33,6 +33,7 @@ library
     , filepath
     , font-awesome-type
     , ghcjs-dom
+    , haskell-web-tracing-framework
     , http-types
     , jsaddle
     , lens

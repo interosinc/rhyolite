@@ -74,6 +74,8 @@ import Rhyolite.Request.Common (decodeValue')
 import Data.Vessel
 import Data.Vessel.ViewMorphism
 
+import WTF
+
 -- | This query morphism translates between queries with SelectedCount annotations used in the frontend to do reference counting, and un-annotated queries for use over the wire. This version is for use with the older Functor style of queries and results.
 functorToWire
   :: ( Filterable q
@@ -421,7 +423,8 @@ openWebSocket' url request vs = do
           -- so that it knows not to send further notifications.
           , tag (fmap ((:[]) . WebSocketRequest_ViewSelector) $ current vs) $ _webSocket_open ws
           ])
-  let (eMessages :: Event t (WebSocketResponse q)) = {-# SCC "fmapMaybe_platformDecode" #-} fmapMaybe platformDecode $ _webSocket_recv ws
+  let platformDecode' v = instrThunk "Rhyolite.Frontend.App.platformDecode"  (platformDecode v)
+      (eMessages :: Event t (WebSocketResponse q)) = {-# SCC "fmapMaybe_platformDecode" #-} fmapMaybe platformDecode' $ _webSocket_recv ws
       notification = fforMaybe eMessages $ \case
         WebSocketResponse_View v -> Just v
         _ -> Nothing
