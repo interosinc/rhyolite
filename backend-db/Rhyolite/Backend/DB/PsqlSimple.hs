@@ -21,6 +21,7 @@ module Rhyolite.Backend.DB.PsqlSimple
   , liftWithConn
   , queryQ, executeQ, executeQ_, sqlQ, traceQueryQ, traceExecuteQ, traceExecuteQ_
   , fromIdRow
+  , WrappedSqlError (..)
   ) where
 
 import Control.Exception.Lifted (Exception, catch, throw)
